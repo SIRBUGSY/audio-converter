@@ -127,6 +127,7 @@
         let ffmpeg = null;
         let inputFile = null;
         let detectedTracks = [];
+        let logLines = []; // Store logs in memory for better parsing
         
         // --- DOM Elements ---
         const dropZone = document.getElementById('drop-zone');
@@ -142,6 +143,7 @@
 
         // --- Utils ---
         const log = (message) => {
+            logLines.push(message);
             logsDiv.innerHTML += `<div>> ${message}</div>`;
             logsDiv.scrollTop = logsDiv.scrollHeight;
             console.log(message);
@@ -203,6 +205,7 @@
         // --- Core Logic ---
         async function handleFile(file) {
             inputFile = file;
+            logLines = []; // Clear logs
             document.getElementById('filename-display').innerText = file.name;
 
             // Switch UI
@@ -218,6 +221,7 @@
                 ffmpeg.FS('writeFile', 'input.mkv', await fetchFile(file));
 
                 try {
+                    // Run without output to just trigger log printing
                     await ffmpeg.run('-i', 'input.mkv');
                 } catch (e) {}
 
@@ -237,19 +241,22 @@
         }
 
         function parseTracksAndShowUI() {
-            const logContent = logsDiv.innerText;
-            const lines = logContent.split('\n');
             detectedTracks = [];
             
-            // Regex to find Audio streams
-            const regex = /Stream #0:(\d+)(?:\((.*?)\))?: Audio: (.*)/;
+            // Updated Regex: Matches "Stream #0:Index... : Audio: Details"
+            // This ignores whatever junk (hex codes, languages) is between index and ": Audio:"
+            const regex = /Stream #0:(\d+).*?: Audio: (.*)/;
+            const langRegex = /\(([a-zA-Z]{3})\)/; // Looks for (eng), (jpn)
 
-            lines.forEach(line => {
+            logLines.forEach(line => {
                 const match = line.match(regex);
                 if (match) {
                     const index = match[1];
-                    const lang = match[2] || 'und';
-                    const details = match[3];
+                    const details = match[2];
+                    
+                    // Try to find language in the whole line
+                    const langMatch = line.match(langRegex);
+                    const lang = langMatch ? langMatch[1] : 'und';
                     
                     if (!detectedTracks.some(t => t.index === index)) {
                         detectedTracks.push({ index, lang, details });
