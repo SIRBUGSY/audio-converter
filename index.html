@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MKV Audio Extractor</title>
+    
+    <!-- IMPORTANT: Load the security header fix immediately -->
+    <script src="coi-serviceworker.js"></script>
+
+    <!-- Tailwind CSS for Styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- FFmpeg WASM -->
+    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <style>
+        body {
+            background-color: #0f172a;
+            color: #e2e8f0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .drag-active {
+            border-color: #38bdf8;
+            background: rgba(56, 189, 248, 0.1);
+        }
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1e293b; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #475569; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #64748b; 
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col items-center justify-center p-4">
+
+    <!-- COOP/COEP Notification -->
+    <div id="security-warning" class="hidden fixed top-0 left-0 w-full bg-orange-600 text-white p-2 text-center text-sm z-50">
+        <i class="fas fa-exclamation-triangle mr-2"></i>
+        SharedArrayBuffer support missing. Please ensure <code>coi-serviceworker.js</code> is in the same folder.
+    </div>
+
+    <div class="glass-panel rounded-2xl shadow-2xl w-full max-w-2xl p-8 transition-all duration-300">
+        
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-sky-400 mb-2">MKV to WAV Extractor</h1>
+            <p class="text-slate-400 text-sm">Extract specific audio tracks from your video files instantly.</p>
+        </div>
+
+        <!-- Step 1: Upload Zone -->
+        <div id="drop-zone" class="border-2 border-dashed border-slate-600 rounded-xl p-10 text-center cursor-pointer transition-all hover:border-slate-400 group">
+            <input type="file" id="file-input" class="hidden" accept=".mkv,.mp4,.webm">
+            <div class="text-6xl text-slate-600 mb-4 group-hover:text-sky-400 transition-colors">
+                <i class="fas fa-cloud-upload-alt"></i>
+            </div>
+            <p class="text-xl font-semibold mb-2">Drag & Drop MKV File</p>
+            <p class="text-slate-500 text-sm">or click to browse</p>
+        </div>
+
+        <!-- Loading State -->
+        <div id="loader" class="hidden py-10 text-center">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-sky-400 mx-auto mb-4"></div>
+            <p id="loader-text" class="text-sky-200 animate-pulse">Initializing Engine...</p>
+        </div>
+
+        <!-- Step 2: Track Selection -->
+        <div id="selection-area" class="hidden">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-semibold text-white">Select Audio Track</h3>
+                <span id="filename-display" class="text-xs bg-slate-700 px-2 py-1 rounded text-slate-300">movie.mkv</span>
+            </div>
+            
+            <div id="track-list" class="space-y-2 max-h-60 overflow-y-auto mb-6 pr-2">
+                <!-- Tracks injected here via JS -->
+            </div>
+
+            <button id="convert-btn" class="w-full bg-sky-600 hover:bg-sky-500 text-white font-bold py-3 px-4 rounded-lg shadow-lg transform transition hover:scale-[1.02] flex items-center justify-center gap-2">
+                <i class="fas fa-wave-square"></i> Convert to WAV
+            </button>
+        </div>
+
+        <!-- Step 3: Success / Download -->
+        <div id="success-area" class="hidden text-center py-6">
+            <div class="text-5xl text-green-400 mb-4">
+                <i class="fas fa-check-circle"></i>
+            </div>
+            <h3 class="text-2xl font-bold text-white mb-2">Conversion Complete!</h3>
+            <p class="text-slate-400 mb-6">Your file is ready.</p>
+            <a id="download-link" href="#" class="inline-block bg-green-600 hover:bg-green-500 text-white font-bold py-3 px-8 rounded-lg shadow-lg transition-colors">
+                Download WAV
+            </a>
+            <button onclick="location.reload()" class="block w-full mt-4 text-slate-500 hover:text-white text-sm">
+                Convert Another File
+            </button>
+        </div>
+
+        <!-- Logs (Optional) -->
+        <div class="mt-6">
+            <div id="log-toggle" class="text-xs text-slate-600 cursor-pointer hover:text-slate-400 text-center">
+                Show/Hide Process Logs
+            </div>
+            <div id="logs" class="hidden mt-2 p-2 bg-black rounded text-xs font-mono text-green-500 h-24 overflow-y-auto border border-slate-800"></div>
+        </div>
+    </div>
+
+    <script>
+        const { createFFmpeg, fetchFile } = FFmpeg;
+        
+        // --- State ---
+        let ffmpeg = null;
+        let inputFile = null;
+        let detectedTracks = [];
+        
+        // --- DOM Elements ---
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const loader = document.getElementById('loader');
+        const loaderText = document.getElementById('loader-text');
+        const selectionArea = document.getElementById('selection-area');
+        const trackList = document.getElementById('track-list');
+        const convertBtn = document.getElementById('convert-btn');
+        const successArea = document.getElementById('success-area');
+        const logsDiv = document.getElementById('logs');
+        const warningBanner = document.getElementById('security-warning');
+
+        // --- Utils ---
+        const log = (message) => {
+            logsDiv.innerHTML += `<div>> ${message}</div>`;
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+            console.log(message);
+        }
+
+        // --- Initialization ---
+        const initFFmpeg = async () => {
+            if (ffmpeg) return;
+
+            // Simple check - coi-serviceworker should have handled this by now
+            // But if it failed, we show the warning.
+            if (typeof SharedArrayBuffer === 'undefined') {
+                warningBanner.classList.remove('hidden');
+                log("Error: SharedArrayBuffer is not available.");
+            }
+
+            ffmpeg = createFFmpeg({ 
+                log: true,
+                progress: ({ ratio }) => {
+                    if(ratio > 0 && ratio < 1) {
+                        loaderText.innerText = `Converting... ${(ratio * 100).toFixed(0)}%`;
+                    }
+                }
+            });
+            
+            ffmpeg.setLogger(({ type, message }) => {
+                log(message);
+            });
+
+            await ffmpeg.load();
+        };
+
+        // --- Drag & Drop Handlers ---
+        dropZone.addEventListener('click', () => fileInput.click());
+        
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('drag-active');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('drag-active');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('drag-active');
+            if (e.dataTransfer.files.length) {
+                handleFile(e.dataTransfer.files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length) {
+                handleFile(e.target.files[0]);
+            }
+        });
+
+        // --- Core Logic ---
+        async function handleFile(file) {
+            inputFile = file;
+            document.getElementById('filename-display').innerText = file.name;
+
+            // Switch UI
+            dropZone.classList.add('hidden');
+            loader.classList.remove('hidden');
+            loaderText.innerText = "Loading FFmpeg Engine...";
+
+            try {
+                await initFFmpeg();
+                
+                loaderText.innerText = "Analyzing file structure...";
+                
+                ffmpeg.FS('writeFile', 'input.mkv', await fetchFile(file));
+
+                try {
+                    await ffmpeg.run('-i', 'input.mkv');
+                } catch (e) {}
+
+                parseTracksAndShowUI();
+
+            } catch (err) {
+                log("Critical Error: " + err.message);
+                // If it fails immediately, it's usually the SharedArrayBuffer issue
+                if(err.message.includes("SharedArrayBuffer")) {
+                   alert("Browser security error. Please make sure coi-serviceworker.js is uploaded to the same folder.");
+                } else {
+                   alert("Failed to initialize: " + err.message);
+                }
+                loader.classList.add('hidden');
+                dropZone.classList.remove('hidden');
+            }
+        }
+
+        function parseTracksAndShowUI() {
+            const logContent = logsDiv.innerText;
+            const lines = logContent.split('\n');
+            detectedTracks = [];
+            
+            // Regex to find Audio streams
+            const regex = /Stream #0:(\d+)(?:\((.*?)\))?: Audio: (.*)/;
+
+            lines.forEach(line => {
+                const match = line.match(regex);
+                if (match) {
+                    const index = match[1];
+                    const lang = match[2] || 'und';
+                    const details = match[3];
+                    
+                    if (!detectedTracks.some(t => t.index === index)) {
+                        detectedTracks.push({ index, lang, details });
+                    }
+                }
+            });
+
+            loader.classList.add('hidden');
+            
+            if (detectedTracks.length === 0) {
+                alert("No audio tracks found (or file header too complex).");
+                dropZone.classList.remove('hidden');
+                return;
+            }
+
+            selectionArea.classList.remove('hidden');
+            renderTrackList();
+        }
+
+        function renderTrackList() {
+            trackList.innerHTML = '';
+            detectedTracks.forEach((track, i) => {
+                const isChecked = i === 0 ? 'checked' : '';
+                const html = `
+                <label class="flex items-center p-3 border border-slate-700 rounded-lg hover:bg-slate-800 cursor-pointer transition-colors group">
+                    <input type="radio" name="audio-track" value="${track.index}" class="form-radio text-sky-500 h-5 w-5 mr-3" ${isChecked}>
+                    <div class="flex-1">
+                        <div class="flex items-center justify-between">
+                            <span class="font-bold text-sky-400">Track #${track.index}</span>
+                            <span class="text-xs uppercase bg-slate-700 px-2 rounded text-slate-300">${track.lang}</span>
+                        </div>
+                        <div class="text-xs text-slate-400 truncate mt-1 group-hover:text-white">${track.details}</div>
+                    </div>
+                </label>
+                `;
+                trackList.innerHTML += html;
+            });
+        }
+
+        // --- Conversion ---
+        convertBtn.addEventListener('click', async () => {
+            const selected = document.querySelector('input[name="audio-track"]:checked');
+            if (!selected) return;
+            
+            const trackIndex = selected.value;
+            
+            selectionArea.classList.add('hidden');
+            loader.classList.remove('hidden');
+            loaderText.innerText = "Converting Audio...";
+
+            const outputName = 'output.wav';
+
+            await ffmpeg.run(
+                '-i', 'input.mkv',
+                '-map', `0:${trackIndex}`,
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100', 
+                outputName
+            );
+
+            const data = ffmpeg.FS('readFile', outputName);
+            const blob = new Blob([data.buffer], { type: 'audio/wav' });
+            const url = URL.createObjectURL(blob);
+            
+            const originalName = inputFile.name.substring(0, inputFile.name.lastIndexOf('.')) || inputFile.name;
+            
+            const downloadLink = document.getElementById('download-link');
+            downloadLink.href = url;
+            downloadLink.download = `${originalName}.wav`;
+
+            loader.classList.add('hidden');
+            successArea.classList.remove('hidden');
+        });
+
+        document.getElementById('log-toggle').addEventListener('click', () => {
+            logsDiv.classList.toggle('hidden');
+        });
+
+    </script>
+</body>
+</html>
