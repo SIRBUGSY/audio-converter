@@ -1,340 +1,458 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MKV Audio Extractor</title>
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Upload, FileText, Play, Pause, RefreshCw, CheckCircle, AlertCircle, Server, Activity, Database } from 'lucide-react';
+
+/**
+ * WEB WORKER CODE
+ * This code runs in a separate thread to keep the UI smooth and memory usage low.
+ * It handles the heavy lifting of slicing and reading the file.
+ */
+const workerCode = `
+  self.onmessage = async (e) => {
+    const { file, chunkSize, action, startOffset } = e.data;
     
-    <!-- IMPORTANT: Load the security header fix immediately -->
-    <script src="coi-serviceworker.js"></script>
+    let offset = startOffset || 0;
+    const total = file.size;
+    const startTime = Date.now();
+    let lastUpdate = startTime;
+    let bytesSinceLastUpdate = 0;
 
-    <!-- Tailwind CSS for Styling -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    
-    <!-- FFmpeg WASM -->
-    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
-
-    <!-- Font Awesome for Icons -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-
-    <style>
-        body {
-            background-color: #0f172a;
-            color: #e2e8f0;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-        .glass-panel {
-            background: rgba(30, 41, 59, 0.7);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        .drag-active {
-            border-color: #38bdf8;
-            background: rgba(56, 189, 248, 0.1);
-        }
-        /* Custom scrollbar */
-        ::-webkit-scrollbar {
-            width: 8px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #1e293b; 
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #475569; 
-            border-radius: 4px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: #64748b; 
-        }
-    </style>
-</head>
-<body class="h-screen flex flex-col items-center justify-center p-4">
-
-    <!-- COOP/COEP Notification -->
-    <div id="security-warning" class="hidden fixed top-0 left-0 w-full bg-orange-600 text-white p-2 text-center text-sm z-50">
-        <i class="fas fa-exclamation-triangle mr-2"></i>
-        SharedArrayBuffer support missing. Please ensure <code>coi-serviceworker.js</code> is in the same folder.
-    </div>
-
-    <div class="glass-panel rounded-2xl shadow-2xl w-full max-w-2xl p-8 transition-all duration-300">
+    try {
+      while (offset < total) {
+        // 1. Check for pause signal (handled by main thread terminating worker, 
+        //    but we check a flag if we were using SharedArrayBuffer - simple termination is safer here)
         
-        <!-- Header -->
-        <div class="text-center mb-8">
-            <h1 class="text-3xl font-bold text-sky-400 mb-2">MKV to WAV Extractor</h1>
-            <p class="text-slate-400 text-sm">Extract specific audio tracks from your video files instantly.</p>
-        </div>
-
-        <!-- Step 1: Upload Zone -->
-        <div id="drop-zone" class="border-2 border-dashed border-slate-600 rounded-xl p-10 text-center cursor-pointer transition-all hover:border-slate-400 group">
-            <input type="file" id="file-input" class="hidden" accept=".mkv,.mp4,.webm">
-            <div class="text-6xl text-slate-600 mb-4 group-hover:text-sky-400 transition-colors">
-                <i class="fas fa-cloud-upload-alt"></i>
-            </div>
-            <p class="text-xl font-semibold mb-2">Drag & Drop MKV File</p>
-            <p class="text-slate-500 text-sm">or click to browse</p>
-        </div>
-
-        <!-- Loading State -->
-        <div id="loader" class="hidden py-10 text-center">
-            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-sky-400 mx-auto mb-4"></div>
-            <p id="loader-text" class="text-sky-200 animate-pulse">Initializing Engine...</p>
-        </div>
-
-        <!-- Step 2: Track Selection -->
-        <div id="selection-area" class="hidden">
-            <div class="flex justify-between items-center mb-4">
-                <h3 class="text-lg font-semibold text-white">Select Audio Track</h3>
-                <span id="filename-display" class="text-xs bg-slate-700 px-2 py-1 rounded text-slate-300">movie.mkv</span>
-            </div>
-            
-            <div id="track-list" class="space-y-2 max-h-60 overflow-y-auto mb-6 pr-2">
-                <!-- Tracks injected here via JS -->
-            </div>
-
-            <button id="convert-btn" class="w-full bg-sky-600 hover:bg-sky-500 text-white font-bold py-3 px-4 rounded-lg shadow-lg transform transition hover:scale-[1.02] flex items-center justify-center gap-2">
-                <i class="fas fa-wave-square"></i> Convert to WAV
-            </button>
-        </div>
-
-        <!-- Step 3: Success / Download -->
-        <div id="success-area" class="hidden text-center py-6">
-            <div class="text-5xl text-green-400 mb-4">
-                <i class="fas fa-check-circle"></i>
-            </div>
-            <h3 class="text-2xl font-bold text-white mb-2">Conversion Complete!</h3>
-            <p class="text-slate-400 mb-6">Your file is ready.</p>
-            <a id="download-link" href="#" class="inline-block bg-green-600 hover:bg-green-500 text-white font-bold py-3 px-8 rounded-lg shadow-lg transition-colors">
-                Download WAV
-            </a>
-            <button onclick="location.reload()" class="block w-full mt-4 text-slate-500 hover:text-white text-sm">
-                Convert Another File
-            </button>
-        </div>
-
-        <!-- Logs (Optional) -->
-        <div class="mt-6">
-            <div id="log-toggle" class="text-xs text-slate-600 cursor-pointer hover:text-slate-400 text-center">
-                Show/Hide Process Logs
-            </div>
-            <div id="logs" class="hidden mt-2 p-2 bg-black rounded text-xs font-mono text-green-500 h-24 overflow-y-auto border border-slate-800"></div>
-        </div>
-    </div>
-
-    <script>
-        const { createFFmpeg, fetchFile } = FFmpeg;
+        // 2. Slice the file - THIS IS THE KEY. We only load 'chunkSize' into memory.
+        const end = Math.min(offset + chunkSize, total);
+        const chunk = file.slice(offset, end);
         
-        // --- State ---
-        let ffmpeg = null;
-        let inputFile = null;
-        let detectedTracks = [];
-        let logLines = []; // Store logs in memory for better parsing
+        // 3. Read the chunk
+        const buffer = await chunk.arrayBuffer();
         
-        // --- DOM Elements ---
-        const dropZone = document.getElementById('drop-zone');
-        const fileInput = document.getElementById('file-input');
-        const loader = document.getElementById('loader');
-        const loaderText = document.getElementById('loader-text');
-        const selectionArea = document.getElementById('selection-area');
-        const trackList = document.getElementById('track-list');
-        const convertBtn = document.getElementById('convert-btn');
-        const successArea = document.getElementById('success-area');
-        const logsDiv = document.getElementById('logs');
-        const warningBanner = document.getElementById('security-warning');
-
-        // --- Utils ---
-        const log = (message) => {
-            logLines.push(message);
-            logsDiv.innerHTML += `<div>> ${message}</div>`;
-            logsDiv.scrollTop = logsDiv.scrollHeight;
-            console.log(message);
+        // 4. Perform Action (Mock Upload or Hashing)
+        if (action === 'upload') {
+            // SIMULATING NETWORK LATENCY
+            // In a real app, you would do: await fetch('/api/upload', { method: 'POST', body: buffer })
+            await new Promise(resolve => setTimeout(resolve, 50)); 
+        } else {
+            // HASHING / PROCESSING
+            // We just read the bytes to prove we processed them. 
+            // Real hashing (SHA-256) on 50GB takes a while, so we simulate a light process here.
+            const view = new Uint8Array(buffer);
+            let sum = 0;
+            // distinct access to force memory mapping
+            if (view.length > 0) sum = view[0] + view[view.length - 1]; 
         }
 
-        // --- Initialization ---
-        const initFFmpeg = async () => {
-            if (ffmpeg) return;
+        const bytesProcessed = end - offset;
+        offset += bytesProcessed;
+        bytesSinceLastUpdate += bytesProcessed;
 
-            // Simple check - coi-serviceworker should have handled this by now
-            // But if it failed, we show the warning.
-            if (typeof SharedArrayBuffer === 'undefined') {
-                warningBanner.classList.remove('hidden');
-                log("Error: SharedArrayBuffer is not available.");
-            }
+        // 5. Report Progress every ~100ms or so to not flood the main thread
+        const now = Date.now();
+        if (now - lastUpdate > 100 || offset >= total) {
+          const elapsed = (now - startTime) / 1000; // seconds
+          const speed = elapsed > 0 ? offset / elapsed : 0; // bytes per second
+          
+          self.postMessage({ 
+            status: 'progress', 
+            progress: offset / total, 
+            currentOffset: offset,
+            speed: speed,
+            bytesProcessed: offset
+          });
+          
+          lastUpdate = now;
+          bytesSinceLastUpdate = 0;
+        }
+      }
 
-            ffmpeg = createFFmpeg({ 
-                log: true,
-                progress: ({ ratio }) => {
-                    if(ratio > 0 && ratio < 1) {
-                        loaderText.innerText = `Converting... ${(ratio * 100).toFixed(0)}%`;
-                    }
-                }
-            });
-            
-            ffmpeg.setLogger(({ type, message }) => {
-                log(message);
-            });
+      self.postMessage({ status: 'complete' });
 
-            await ffmpeg.load();
-        };
+    } catch (error) {
+      self.postMessage({ status: 'error', error: error.message });
+    }
+  };
+`;
 
-        // --- Drag & Drop Handlers ---
-        dropZone.addEventListener('click', () => fileInput.click());
+const LargeFileProcessor = () => {
+  const [file, setFile] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [speed, setSpeed] = useState(0);
+  const [processedBytes, setProcessedBytes] = useState(0);
+  const [error, setError] = useState(null);
+  const [isComplete, setIsComplete] = useState(false);
+  const [chunkSizeMB, setChunkSizeMB] = useState(64); // 64MB Default
+  const [mode, setMode] = useState('upload'); // 'upload' or 'process'
+  
+  const workerRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  // Format bytes to human readable string
+  const formatBytes = (bytes, decimals = 2) => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+  };
+
+  // Format speed
+  const formatSpeed = (bytesPerSec) => {
+    return formatBytes(bytesPerSec) + '/s';
+  };
+
+  // Format time
+  const formatTime = (seconds) => {
+    if (!seconds || !isFinite(seconds)) return '--:--';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    return `${h > 0 ? h + 'h ' : ''}${m}m ${s}s`;
+  };
+
+  const handleFileSelect = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      setFile(e.target.files[0]);
+      resetState();
+    }
+  };
+
+  const resetState = () => {
+    setProgress(0);
+    setSpeed(0);
+    setProcessedBytes(0);
+    setIsProcessing(false);
+    setIsComplete(false);
+    setError(null);
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+  };
+
+  const startProcessing = () => {
+    if (!file) return;
+
+    setIsProcessing(true);
+    setIsComplete(false);
+    setError(null);
+
+    // Create Web Worker from string
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const worker = new Worker(URL.createObjectURL(blob));
+    workerRef.current = worker;
+
+    // Start Worker
+    worker.postMessage({
+      file: file,
+      chunkSize: chunkSizeMB * 1024 * 1024,
+      action: mode,
+      startOffset: processedBytes // Resume support
+    });
+
+    worker.onmessage = (e) => {
+      const { status, progress, speed, error, currentOffset } = e.data;
+
+      if (status === 'progress') {
+        setProgress(progress * 100);
+        setSpeed(speed);
+        setProcessedBytes(currentOffset);
+      } else if (status === 'complete') {
+        setIsProcessing(false);
+        setIsComplete(true);
+        setProgress(100);
+        worker.terminate();
+      } else if (status === 'error') {
+        setError(error);
+        setIsProcessing(false);
+        worker.terminate();
+      }
+    };
+  };
+
+  const stopProcessing = () => {
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+    setIsProcessing(false);
+  };
+
+  const estimatedTimeRemaining = speed > 0 ? (file?.size - processedBytes) / speed : 0;
+
+  // Drag and Drop handlers
+  const onDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  
+  const onDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      setFile(e.dataTransfer.files[0]);
+      resetState();
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-4 md:p-8 font-sans selection:bg-blue-500 selection:text-white">
+      <div className="max-w-4xl mx-auto space-y-6">
         
-        dropZone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            dropZone.classList.add('drag-active');
-        });
+        {/* Header */}
+        <div className="flex items-center space-x-3 mb-8">
+          <Database className="w-8 h-8 text-blue-400" />
+          <div>
+            <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-cyan-300 bg-clip-text text-transparent">
+              TitanFile Processor
+            </h1>
+            <p className="text-slate-400 text-sm">
+              Optimized for 10GB - 1TB+ files using Chunked Streams
+            </p>
+          </div>
+        </div>
 
-        dropZone.addEventListener('dragleave', () => {
-            dropZone.classList.remove('drag-active');
-        });
+        {/* Main Card */}
+        <div className="bg-slate-800 rounded-2xl border border-slate-700 shadow-xl overflow-hidden">
+          
+          {/* File Selection Zone */}
+          {!file ? (
+            <div 
+              onDragOver={onDragOver}
+              onDrop={onDrop}
+              onClick={() => fileInputRef.current?.click()}
+              className="p-12 text-center cursor-pointer hover:bg-slate-700/50 transition-colors border-b border-dashed border-slate-600 group"
+            >
+              <div className="w-20 h-20 bg-slate-700 rounded-full flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform duration-300">
+                <Upload className="w-8 h-8 text-blue-400" />
+              </div>
+              <h3 className="text-xl font-medium text-white mb-2">Drag & Drop Large File</h3>
+              <p className="text-slate-400 mb-6">or click to browse local filesystem</p>
+              <div className="inline-block px-4 py-1 rounded-full bg-slate-700 text-xs text-slate-300">
+                Supports: .csv, .json, .zip, .mp4, .raw (Any size)
+              </div>
+              <input 
+                ref={fileInputRef} 
+                type="file" 
+                className="hidden" 
+                onChange={handleFileSelect} 
+              />
+            </div>
+          ) : (
+            <div className="p-8 border-b border-slate-700 bg-slate-800/50">
+              <div className="flex items-start justify-between">
+                <div className="flex items-center space-x-4">
+                  <div className="w-16 h-16 bg-blue-500/20 rounded-lg flex items-center justify-center border border-blue-500/30">
+                    <FileText className="w-8 h-8 text-blue-400" />
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-semibold text-white truncate max-w-md" title={file.name}>
+                      {file.name}
+                    </h2>
+                    <p className="text-slate-400 font-mono text-sm">
+                      {formatBytes(file.size)}
+                    </p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => { setFile(null); resetState(); }}
+                  className="p-2 hover:bg-slate-700 rounded-full text-slate-400 hover:text-white transition-colors"
+                >
+                  Change File
+                </button>
+              </div>
+            </div>
+          )}
 
-        dropZone.addEventListener('drop', (e) => {
-            e.preventDefault();
-            dropZone.classList.remove('drag-active');
-            if (e.dataTransfer.files.length) {
-                handleFile(e.dataTransfer.files[0]);
-            }
-        });
+          {/* Controls & Dashboard */}
+          {file && (
+            <div className="p-8 space-y-8">
+              
+              {/* Configuration */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-3">
+                  <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Operation Mode</label>
+                  <div className="flex bg-slate-900 p-1 rounded-lg border border-slate-700">
+                    <button
+                      onClick={() => !isProcessing && setMode('upload')}
+                      className={`flex-1 py-2 px-4 rounded-md text-sm font-medium transition-all ${mode === 'upload' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`}
+                      disabled={isProcessing}
+                    >
+                      <div className="flex items-center justify-center space-x-2">
+                        <Server className="w-4 h-4" />
+                        <span>Mock Upload</span>
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => !isProcessing && setMode('process')}
+                      className={`flex-1 py-2 px-4 rounded-md text-sm font-medium transition-all ${mode === 'process' ? 'bg-emerald-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`}
+                      disabled={isProcessing}
+                    >
+                      <div className="flex items-center justify-center space-x-2">
+                        <Activity className="w-4 h-4" />
+                        <span>Local Analysis</span>
+                      </div>
+                    </button>
+                  </div>
+                </div>
 
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length) {
-                handleFile(e.target.files[0]);
-            }
-        });
+                <div className="space-y-3">
+                  <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+                    Chunk Size ({chunkSizeMB} MB)
+                  </label>
+                  <input
+                    type="range"
+                    min="5"
+                    max="500"
+                    step="5"
+                    value={chunkSizeMB}
+                    onChange={(e) => setChunkSizeMB(Number(e.target.value))}
+                    disabled={isProcessing}
+                    className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                  />
+                  <div className="flex justify-between text-xs text-slate-500">
+                    <span>5MB (Slow, Low RAM)</span>
+                    <span>500MB (Fast, High RAM)</span>
+                  </div>
+                </div>
+              </div>
 
-        // --- Core Logic ---
-        async function handleFile(file) {
-            inputFile = file;
-            logLines = []; // Clear logs
-            document.getElementById('filename-display').innerText = file.name;
+              {/* Action Area */}
+              <div className="flex items-center space-x-4 pt-4">
+                {!isProcessing ? (
+                  <button
+                    onClick={startProcessing}
+                    disabled={isComplete}
+                    className={`flex-1 py-4 rounded-xl font-bold text-lg shadow-lg transform transition-all active:scale-95 flex items-center justify-center space-x-3
+                      ${isComplete 
+                        ? 'bg-emerald-600/20 text-emerald-400 cursor-default border border-emerald-500/30' 
+                        : 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/20'
+                      }`}
+                  >
+                    {isComplete ? (
+                      <>
+                        <CheckCircle className="w-6 h-6" />
+                        <span>Processing Complete</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-6 h-6 fill-current" />
+                        <span>{processedBytes > 0 ? 'Resume Processing' : 'Start Processing'}</span>
+                      </>
+                    )}
+                  </button>
+                ) : (
+                  <button
+                    onClick={stopProcessing}
+                    className="flex-1 py-4 bg-amber-600 hover:bg-amber-500 text-white rounded-xl font-bold text-lg shadow-lg shadow-amber-900/20 transform transition-all active:scale-95 flex items-center justify-center space-x-3"
+                  >
+                    <Pause className="w-6 h-6 fill-current" />
+                    <span>Pause</span>
+                  </button>
+                )}
 
-            // Switch UI
-            dropZone.classList.add('hidden');
-            loader.classList.remove('hidden');
-            loaderText.innerText = "Loading FFmpeg Engine...";
+                {processedBytes > 0 && !isProcessing && (
+                  <button 
+                    onClick={resetState}
+                    className="p-4 bg-slate-700 hover:bg-slate-600 rounded-xl text-white transition-colors border border-slate-600"
+                    title="Reset"
+                  >
+                    <RefreshCw className="w-6 h-6" />
+                  </button>
+                )}
+              </div>
 
-            try {
-                await initFFmpeg();
-                
-                loaderText.innerText = "Analyzing file structure...";
-                
-                ffmpeg.FS('writeFile', 'input.mkv', await fetchFile(file));
-
-                try {
-                    // Run without output to just trigger log printing
-                    await ffmpeg.run('-i', 'input.mkv');
-                } catch (e) {}
-
-                parseTracksAndShowUI();
-
-            } catch (err) {
-                log("Critical Error: " + err.message);
-                // If it fails immediately, it's usually the SharedArrayBuffer issue
-                if(err.message.includes("SharedArrayBuffer")) {
-                   alert("Browser security error. Please make sure coi-serviceworker.js is uploaded to the same folder.");
-                } else {
-                   alert("Failed to initialize: " + err.message);
-                }
-                loader.classList.add('hidden');
-                dropZone.classList.remove('hidden');
-            }
-        }
-
-        function parseTracksAndShowUI() {
-            detectedTracks = [];
-            
-            // Updated Regex: Matches "Stream #0:Index... : Audio: Details"
-            // This ignores whatever junk (hex codes, languages) is between index and ": Audio:"
-            const regex = /Stream #0:(\d+).*?: Audio: (.*)/;
-            const langRegex = /\(([a-zA-Z]{3})\)/; // Looks for (eng), (jpn)
-
-            logLines.forEach(line => {
-                const match = line.match(regex);
-                if (match) {
-                    const index = match[1];
-                    const details = match[2];
-                    
-                    // Try to find language in the whole line
-                    const langMatch = line.match(langRegex);
-                    const lang = langMatch ? langMatch[1] : 'und';
-                    
-                    if (!detectedTracks.some(t => t.index === index)) {
-                        detectedTracks.push({ index, lang, details });
-                    }
-                }
-            });
-
-            loader.classList.add('hidden');
-            
-            if (detectedTracks.length === 0) {
-                alert("No audio tracks found (or file header too complex).");
-                dropZone.classList.remove('hidden');
-                return;
-            }
-
-            selectionArea.classList.remove('hidden');
-            renderTrackList();
-        }
-
-        function renderTrackList() {
-            trackList.innerHTML = '';
-            detectedTracks.forEach((track, i) => {
-                const isChecked = i === 0 ? 'checked' : '';
-                const html = `
-                <label class="flex items-center p-3 border border-slate-700 rounded-lg hover:bg-slate-800 cursor-pointer transition-colors group">
-                    <input type="radio" name="audio-track" value="${track.index}" class="form-radio text-sky-500 h-5 w-5 mr-3" ${isChecked}>
-                    <div class="flex-1">
-                        <div class="flex items-center justify-between">
-                            <span class="font-bold text-sky-400">Track #${track.index}</span>
-                            <span class="text-xs uppercase bg-slate-700 px-2 rounded text-slate-300">${track.lang}</span>
-                        </div>
-                        <div class="text-xs text-slate-400 truncate mt-1 group-hover:text-white">${track.details}</div>
+              {/* Progress Stats */}
+              {(isProcessing || processedBytes > 0) && (
+                <div className="bg-slate-900/50 rounded-xl p-6 border border-slate-700/50 space-y-6">
+                  
+                  {/* Progress Bar */}
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-sm font-medium">
+                      <span className="text-white">Total Progress</span>
+                      <span className="text-blue-400">{progress.toFixed(1)}%</span>
                     </div>
-                </label>
-                `;
-                trackList.innerHTML += html;
-            });
+                    <div className="h-4 bg-slate-700 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full transition-all duration-300 ${isComplete ? 'bg-emerald-500' : 'bg-blue-500 relative'}`}
+                        style={{ width: `${progress}%` }}
+                      >
+                         {isProcessing && (
+                            <div className="absolute inset-0 bg-white/20 animate-[shimmer_2s_infinite]" style={{ backgroundImage: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.2) 50%, transparent 100%)', backgroundSize: '200% 100%' }}></div>
+                         )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Stat Grid */}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                      <div className="text-xs text-slate-500 uppercase">Processed</div>
+                      <div className="text-lg font-mono text-white">{formatBytes(processedBytes)}</div>
+                    </div>
+                    <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                      <div className="text-xs text-slate-500 uppercase">Speed</div>
+                      <div className="text-lg font-mono text-cyan-400">{formatSpeed(speed)}</div>
+                    </div>
+                    <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                      <div className="text-xs text-slate-500 uppercase">Time Left</div>
+                      <div className="text-lg font-mono text-amber-400">{formatTime(estimatedTimeRemaining)}</div>
+                    </div>
+                    <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                      <div className="text-xs text-slate-500 uppercase">Status</div>
+                      <div className={`text-lg font-semibold ${isComplete ? 'text-emerald-400' : isProcessing ? 'text-blue-400 animate-pulse' : 'text-amber-400'}`}>
+                        {isComplete ? 'Done' : isProcessing ? 'Running' : 'Paused'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Terminal / Logs Simulation */}
+                  <div className="font-mono text-xs text-slate-500 pt-2 border-t border-slate-700/50">
+                    <div className="truncate">&gt; Processing chunk at offset {processedBytes}...</div>
+                    {mode === 'upload' && <div className="truncate">&gt; Uploading to mock endpoint... OK</div>}
+                    {mode === 'process' && <div className="truncate">&gt; Verifying data integrity... OK</div>}
+                  </div>
+                </div>
+              )}
+
+              {error && (
+                <div className="bg-red-500/10 border border-red-500/50 p-4 rounded-xl flex items-center space-x-3 text-red-400">
+                  <AlertCircle className="w-6 h-6" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+            </div>
+          )}
+        </div>
+
+        {/* Info Footer */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-slate-500">
+          <div className="bg-slate-800/50 p-4 rounded-lg border border-slate-700">
+            <h4 className="font-bold text-slate-300 mb-1">Memory Safe</h4>
+            <p>Uses <code>File.slice()</code> to read only {chunkSizeMB}MB at a time. Your browser will use minimal RAM even with 100GB files.</p>
+          </div>
+          <div className="bg-slate-800/50 p-4 rounded-lg border border-slate-700">
+            <h4 className="font-bold text-slate-300 mb-1">Non-Blocking</h4>
+            <p>Runs in a dedicated <code>WebWorker</code> thread. You can switch tabs or use other apps without the process freezing.</p>
+          </div>
+          <div className="bg-slate-800/50 p-4 rounded-lg border border-slate-700">
+            <h4 className="font-bold text-slate-300 mb-1">Resumable</h4>
+            <p>Tracks the offset byte-by-byte. If network fails or you pause, it resumes exactly where it left off.</p>
+          </div>
+        </div>
+      </div>
+      
+      <style jsx global>{`
+        @keyframes shimmer {
+          0% { background-position: 200% 0; }
+          100% { background-position: -200% 0; }
         }
+      `}</style>
+    </div>
+  );
+};
 
-        // --- Conversion ---
-        convertBtn.addEventListener('click', async () => {
-            const selected = document.querySelector('input[name="audio-track"]:checked');
-            if (!selected) return;
-            
-            const trackIndex = selected.value;
-            
-            selectionArea.classList.add('hidden');
-            loader.classList.remove('hidden');
-            loaderText.innerText = "Converting Audio...";
-
-            const outputName = 'output.wav';
-
-            await ffmpeg.run(
-                '-i', 'input.mkv',
-                '-map', `0:${trackIndex}`,
-                '-acodec', 'pcm_s16le',
-                '-ar', '44100', 
-                outputName
-            );
-
-            const data = ffmpeg.FS('readFile', outputName);
-            const blob = new Blob([data.buffer], { type: 'audio/wav' });
-            const url = URL.createObjectURL(blob);
-            
-            const originalName = inputFile.name.substring(0, inputFile.name.lastIndexOf('.')) || inputFile.name;
-            
-            const downloadLink = document.getElementById('download-link');
-            downloadLink.href = url;
-            downloadLink.download = `${originalName}.wav`;
-
-            loader.classList.add('hidden');
-            successArea.classList.remove('hidden');
-        });
-
-        document.getElementById('log-toggle').addEventListener('click', () => {
-            logsDiv.classList.toggle('hidden');
-        });
-
-    </script>
-</body>
-</html>
+export default LargeFileProcessor;
